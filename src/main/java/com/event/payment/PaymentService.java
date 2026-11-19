@@ -31,6 +31,10 @@ public class PaymentService {
     @Value("${payment.reconcile.stale-after-seconds:60}")
     private long staleAfterSeconds;
 
+    // must be comfortably longer than the slowest real bank call
+    @Value("${payment.reconcile.processing-timeout-seconds:300}")
+    private long processingTimeoutSeconds;
+
     public Payment processPaymentRequest(String idempotencyKey, PaymentRequest request) {
         validate(idempotencyKey, request);
         String hash = fingerprint(request);
@@ -67,6 +71,12 @@ public class PaymentService {
 
     @Scheduled(fixedDelayString = "${payment.reconcile.interval-ms:30000}")
     public void republishStalePending() {
+        // a consumer that died after claiming leaves the row in PROCESSING forever; hand it back
+        int reset = paymentRepository.resetStaleProcessing(LocalDateTime.now().minusSeconds(processingTimeoutSeconds));
+        if (reset > 0) {
+            log.warn("Reset {} stuck PROCESSING payments to PENDING", reset);
+        }
+
         LocalDateTime cutoff = LocalDateTime.now().minusSeconds(staleAfterSeconds);
         var stale = paymentRepository.findTop100ByStatusAndCreatedAtBeforeOrderByIdAsc(PaymentStatus.PENDING, cutoff);
         if (!stale.isEmpty()) {

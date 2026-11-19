@@ -1,101 +1,77 @@
 # Event-Driven Payment Processing Engine
 
-> A microservice-based payment processing system designed to handle high-throughput, asynchronous transactions securely. This project demonstrates enterprise-grade architecture patterns, specifically tailored for scalable financial networks and payment gateways.
+A Spring Boot service that accepts payment requests over REST, persists them idempotently in PostgreSQL,
+and processes them asynchronously through Apache Kafka.
 
----
+> Single Spring Boot module: the REST gateway (producer) and the processor (Kafka consumer) live in the
+> same app. They only talk through Kafka, so they can be split into two deployables later.
 
-## ️ Architecture Overview
+## Flow
 
-The system consists of two decoupled Spring Boot microservices communicating asynchronously via **Apache Kafka**.
+1. `POST /api/v1/payments` validates the request and the `Idempotency-Key` header.
+2. The payment is saved as `PENDING` (unique constraint on the key = DB-level idempotency).
+3. After the row is committed, a `PaymentEvent` is published to `payment-events`. Client gets `202 Accepted` + JSON.
+4. The consumer **claims** the payment with an atomic `UPDATE ... WHERE status='PENDING'` (-> `PROCESSING`).
+   Only one consumer can win the claim, so duplicate events never cause a second bank call.
+5. After the (simulated) bank call it moves to `COMPLETED` or `FAILED`.
+6. `GET /api/v1/payments/{id}` returns the current status.
 
-### 1. Payment Gateway (Service A - Producer)
-* **API Entry Point:** Exposes a RESTful API (`POST /api/v1/payments`).
-* **Validation:** Handles immediate request validation.
-* **Security:** Enforces database-level idempotency to prevent duplicate transaction submissions.
-* **Event Publishing:** Saves a `PENDING` state and publishes a `PaymentEvent` to Kafka.
-* **High Availability:** Returns a non-blocking `202 Accepted` to the client.
+Safety nets:
+- **Reconciler** (`@Scheduled`): republishes `PENDING` rows older than 60s (lost Kafka publish) and resets
+  `PROCESSING` rows older than 5 min (consumer crashed mid-flight).
+- **Dead-letter topic** `payment-events.DLT`: poison messages are retried 3x, then parked.
+- **Fail-fast producer**: `max.block.ms=2000`, so a Kafka outage returns quickly instead of hanging requests;
+  the payment stays `PENDING` and the reconciler publishes it once Kafka is back.
 
-### 2. Core Processor (Service B - Consumer)
-* **Event Listener:** Acts as an asynchronous Kafka consumer.
-* **Safety Checks:** Implements consumer-side idempotency checks to handle "at-least-once" delivery semantics safely.
-* **Business Logic:** Simulates downstream banking transaction processing.
-* **State Management:** Updates the database transaction state to `COMPLETED` or `FAILED`.
+## Idempotency behaviour
 
----
+| Situation | Result |
+|---|---|
+| New key | `202`, payment saved + published |
+| Same key, same body | `202`, the original payment is returned (no new charge) |
+| Same key, different body | `422 Unprocessable Entity` |
+| Invalid key / same source & destination / bad amount | `400` |
 
-## Tech Stack
+## Tech stack
 
-* **Backend:** Java 17, Spring Boot 3.x, Spring Data JPA, Spring Web
-* **Messaging:** Apache Kafka, Zookeeper, Spring for Apache Kafka
-* **Database:** PostgreSQL 15
-* **Infrastructure:** Docker, Docker Compose
-* **Testing:** JUnit 5, Mockito, Testcontainers
+Java 17, Spring Boot 4.x, Spring Data JPA, Spring for Apache Kafka 4 (Jackson 3 serializers),
+PostgreSQL 15, Kafka (KRaft, no Zookeeper), Docker Compose, JUnit 5 + Mockito, k6.
 
----
-
-## Key Engineering Decisions
-
-*  **Dual-Tier Idempotency:** Idempotency keys are passed via HTTP headers to guarantee that network retries do not result in double charges. This is enforced via database unique constraints (Gateway) and state-validation (Consumer).
-*  **Financial Data Precision:** Strictly utilizing `BigDecimal` rather than `Double` or `Float` to prevent catastrophic floating-point rounding errors during financial calculations.
-*  **Resilience & Backpressure:** The REST Gateway is completely insulated from downstream processing bottlenecks. If the Core Processor experiences downtime, the Gateway continues to accept traffic, queueing messages in Kafka with zero data loss.
-*  **Observability Readiness:** Prepared for distributed tracing by passing correlation IDs, ensuring full visibility of a transaction's lifecycle across microservices.
-
----
-
-##  Getting Started
-
-### Prerequisites
-* Java 17 or higher
-* Maven 3.8+
-* Docker and Docker Compose
-
-### 1. Start the Infrastructure
-Navigate to the root directory and start the PostgreSQL database and Kafka broker using Docker Compose. *(This exposes PostgreSQL on port 5432 and Kafka on port 9092.)*
+## Getting started
 
 ```bash
-docker-compose up -d
+docker compose up -d          # Postgres :5432 + Kafka :9092
+./mvnw spring-boot:run        # app on http://localhost:8080
 ```
 
-### 2. Run the Microservices
-You will need two separate terminal windows to run both services concurrently.
+Config is read from environment variables with local-dev defaults that match `docker-compose.yml`:
+`DB_URL`, `DB_USER`, `DB_PASSWORD`, `KAFKA_BOOTSTRAP`, `DDL_AUTO`. Never commit real credentials.
 
-**Start the Payment Gateway:** *(Runs on http://localhost:8080)*
 ```bash
-cd payment-gateway
-mvn spring-boot:run
+curl -i -X POST http://localhost:8080/api/v1/payments \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: demo-12345" \
+  -d '{"sourceAccount":"ACC-9999","destinationAccount":"ACC-1111","amount":250.50}'
+# HTTP/1.1 202  {"paymentId":1,"status":"PENDING","failureReason":null}
+
+curl http://localhost:8080/api/v1/payments/1     # -> COMPLETED after ~50ms
 ```
 
-**Start the Core Processor:** *(Runs on http://localhost:8081)*
+Re-sending the exact same request returns `202` with the **same** `paymentId`; changing the amount under the
+same key returns `422`.
+
+## Tests
+
 ```bash
-cd payment-processor
-mvn spring-boot:run
+./mvnw test        # unit tests, no Docker needed
 ```
 
----
+Load test (needs [k6](https://k6.io)): `k6 run -e BASE_URL=http://localhost:8080 load-test/k6-payment-load.js`
 
-##  Testing the API
+## Known limitations / next steps
 
-Once both services are running, you can simulate a payment request using `cURL`.
-
-**The Request:**
-```bash
-curl -X POST http://localhost:8080/api/v1/payments \
--H "Content-Type: application/json" \
--H "Idempotency-Key: uuid-12345-abcde" \
--d '{
-"sourceAccount": "ACC-9999",
-"destinationAccount": "ACC-1111",
-"amount": 250.50
-}'
-```
-
-**The Expected Response:**
-```http
-HTTP/1.1 202 Accepted
-Payment accepted for processing
-```
-
-###  Verify the Architecture:
-1. Check the **Payment Gateway** console logs to see the `PENDING` transaction saved and the Kafka event published.
-2. Check the **Core Processor** console logs to see the event instantly consumed, processed, and marked as `COMPLETED`.
-3.  **The Duplicate Test:** Try sending the exact same cURL request again. You will receive an error, demonstrating that the idempotency constraint successfully blocked a duplicate charge!
+- No authentication, and payment IDs are sequential. Add auth and ownership checks before exposing it.
+- `ddl-auto=update` is for development; use Flyway or Liquibase for real deployments.
+- The bank is simulated. A real integration must pass the idempotency key downstream.
+- No correlation-ID propagation or metrics yet (Actuator + Micrometer tracing would be the next step).
+- Add integration tests with Testcontainers (Postgres + Kafka) to cover the full flow.
