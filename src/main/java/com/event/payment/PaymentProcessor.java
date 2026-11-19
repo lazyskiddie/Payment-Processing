@@ -24,12 +24,16 @@ public class PaymentProcessor {
     public void consumePaymentEvent(PaymentEvent event) {
         log.info("Received PaymentEvent for payment {}", event.paymentId());
 
-        Payment payment = paymentRepository.findById(event.paymentId())
-                .orElseThrow(() -> new IllegalStateException("Payment not found: " + event.paymentId()));
-
-        // consumer-side idempotency: covers COMPLETED and FAILED, not just COMPLETED
-        if (payment.getStatus() != PaymentStatus.PENDING) {
-            log.info("Payment {} already {}; skipping", payment.getId(), payment.getStatus());
+        // FIX: CLAIM FIRST, call the bank second. The conditional UPDATE returns 1 for exactly one
+        // consumer, so a duplicate event (reconciler republish, redelivery, two consumers) can never
+        // trigger a second bank call.
+        int claimed = paymentRepository.markProcessing(event.paymentId(), LocalDateTime.now());
+        if (claimed == 0) {
+            if (!paymentRepository.existsById(event.paymentId())) {
+                // goes to the error handler: retried a few times, then to payment-events.DLT
+                throw new IllegalStateException("Payment not found: " + event.paymentId());
+            }
+            log.info("Payment {} already claimed or finished; skipping", event.paymentId());
             return;
         }
 
@@ -37,21 +41,21 @@ public class PaymentProcessor {
         try {
             approved = callBank(event);
         } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();          // don't swallow the interrupt
+            Thread.currentThread().interrupt();
+            // stays PROCESSING; the reconciler resets it to PENDING after the timeout
             throw new IllegalStateException("Interrupted while calling bank", e);
         }
 
-        // conditional UPDATE ... WHERE status='PENDING' -> safe even if two consumers race
         if (approved) {
-            paymentRepository.markCompleted(payment.getId(), LocalDateTime.now());
-            log.info("Payment {} COMPLETED", payment.getId());
+            paymentRepository.markCompleted(event.paymentId(), LocalDateTime.now());
+            log.info("Payment {} COMPLETED", event.paymentId());
         } else {
-            paymentRepository.markFailed(payment.getId(), "Declined: amount exceeds limit", LocalDateTime.now());
-            log.warn("Payment {} declined", payment.getId());
+            paymentRepository.markFailed(event.paymentId(), "Declined: amount exceeds limit", LocalDateTime.now());
+            log.warn("Payment {} declined", event.paymentId());
         }
     }
 
-    // Simulated bank. In real life pass the idempotency key downstream so the bank can de-duplicate too.
+    // Simulated bank. With a real bank, send event.idempotencyKey() downstream so the bank can de-duplicate too.
     private boolean callBank(PaymentEvent event) throws InterruptedException {
         Thread.sleep(bankLatencyMs);
         return event.amount().compareTo(DECLINE_ABOVE) <= 0;
