@@ -17,15 +17,31 @@ public interface PaymentRepository extends JpaRepository<Payment, Long> {
 
     List<Payment> findTop100ByStatusAndCreatedAtBeforeOrderByIdAsc(PaymentStatus status, LocalDateTime before);
 
+     // Atomic claim: only ONE caller gets 1 back, everyone else gets 0
+     // This is what stops two consumers from both calling the bank for the same payment
+    @Modifying
+    @Transactional
+    @Query("update Payment p set p.status = com.event.payment.PaymentStatus.PROCESSING, p.processingStartedAt = :now "
+            + "where p.id = :id and p.status = com.event.payment.PaymentStatus.PENDING")
+    int markProcessing(@Param("id") Long id, @Param("now") LocalDateTime now);
+
     @Modifying
     @Transactional
     @Query("update Payment p set p.status = com.event.payment.PaymentStatus.COMPLETED, p.processedAt = :now "
-            + "where p.id = :id and p.status = com.event.payment.PaymentStatus.PENDING")
+            + "where p.id = :id and p.status = com.event.payment.PaymentStatus.PROCESSING")
     int markCompleted(@Param("id") Long id, @Param("now") LocalDateTime now);
 
     @Modifying
     @Transactional
     @Query("update Payment p set p.status = com.event.payment.PaymentStatus.FAILED, p.failureReason = :reason, "
-            + "p.processedAt = :now where p.id = :id and p.status = com.event.payment.PaymentStatus.PENDING")
+            + "p.processedAt = :now where p.id = :id and p.status = com.event.payment.PaymentStatus.PROCESSING")
     int markFailed(@Param("id") Long id, @Param("reason") String reason, @Param("now") LocalDateTime now);
+
+    // Consumer crashed after claiming? Put the payment back to PENDING so it gets retried
+    @Modifying
+    @Transactional
+    @Query("update Payment p set p.status = com.event.payment.PaymentStatus.PENDING, p.processingStartedAt = null "
+            + "where p.status = com.event.payment.PaymentStatus.PROCESSING and p.processingStartedAt < :cutoff")
+    int resetStaleProcessing(@Param("cutoff") LocalDateTime cutoff);
 }
+
