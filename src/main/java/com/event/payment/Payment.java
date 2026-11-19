@@ -1,17 +1,25 @@
 package com.event.payment;
 
-import jakarta.persistence.*;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
-import lombok.Data;
+import lombok.Getter;
 import lombok.NoArgsConstructor;
+import lombok.Setter;
 import org.hibernate.annotations.CreationTimestamp;
-import org.springframework.data.annotation.Id;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
-@Data
+@Getter // @Data generates equals/hashCode over every mutable field
+@Setter
 @Entity
 @NoArgsConstructor
 @AllArgsConstructor
@@ -46,6 +54,9 @@ public class Payment {
     @CreationTimestamp
     @Column(updatable = false)
     private LocalDateTime createdAt;
+
+    // When a consumer claimed this payment; lets the reconciler recover from a consumer that died mid-flight.
+    private LocalDateTime processingStartedAt;
 
     private LocalDateTime processedAt;
 }
